@@ -4,6 +4,7 @@
 # torchrun --nproc-per-node=4 -m gpt_oss.generate -p "why did the chicken cross the road?" model/
 
 import argparse
+import os
 
 from gpt_oss.tokenizer import get_tokenizer
 
@@ -14,6 +15,11 @@ def main(args):
             from gpt_oss.torch.utils import init_distributed
             from gpt_oss.torch.model import TokenGenerator as TorchGenerator
             device = init_distributed()
+            # Environment variables pass config via checkpoint config.json; for quick toggles, set env
+            if args.toroidal_linear:
+                os.environ["GPT_OSS_TOROIDAL_LINEAR"] = "1"
+            if args.circular_causal:
+                os.environ["GPT_OSS_CIRCULAR_CAUSAL"] = "1"
             generator = TorchGenerator(args.checkpoint, device=device)
         case "triton":
             from gpt_oss.torch.utils import init_distributed
@@ -77,6 +83,16 @@ if __name__ == "__main__":
         default="torch",
         choices=["triton", "torch", "vllm"],
         help="Inference backend",
+    )
+    parser.add_argument(
+        "--toroidal-linear",
+        action="store_true",
+        help="Enable toroidal linear wrapping (torch backend only)",
+    )
+    parser.add_argument(
+        "--circular-causal",
+        action="store_true",
+        help="Enable circular causal attention mask (torch backend only)",
     )
     args = parser.parse_args()
 

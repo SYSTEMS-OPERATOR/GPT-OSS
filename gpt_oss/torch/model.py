@@ -27,6 +27,9 @@ class ModelConfig:
     rope_scaling_factor: float = 32.0
     rope_ntk_alpha: float = 1.0
     rope_ntk_beta: float = 32.0
+    # Seamless/toroidal options
+    toroidal_linear: bool = False
+    circular_causal: bool = False
 
 
 class RMSNorm(torch.nn.Module):
@@ -45,6 +48,39 @@ class RMSNorm(torch.nn.Module):
         t, dtype = x.float(), x.dtype
         t = t * torch.rsqrt(torch.mean(t**2, dim=-1, keepdim=True) + self.eps)
         return (t * self.scale).to(dtype)
+
+
+# Seamless toroidal helpers
+
+def _pad_toroid_2d(weight_2d: torch.Tensor) -> torch.Tensor:
+    w = torch.cat([weight_2d[-1:], weight_2d, weight_2d[:1]], dim=0)
+    w = torch.cat([w[:, -1:], w, w[:, :1]], dim=1)
+    return w
+
+
+def _circular_pad_last_dim(x: torch.Tensor) -> torch.Tensor:
+    return torch.cat([x[..., -1:], x, x[..., :1]], dim=-1)
+
+
+def _center_slice_last_dim(x: torch.Tensor) -> torch.Tensor:
+    return x[..., 1:-1]
+
+
+class ToroidalLinear(torch.nn.Module):
+    def __init__(self, base_linear: torch.nn.Linear):
+        super().__init__()
+        self.base = base_linear
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        W = self.base.weight
+        b = self.base.bias
+        W_pad = _pad_toroid_2d(W)
+        x_pad = _circular_pad_last_dim(x)
+        y_pad = x_pad.matmul(W_pad.transpose(-1, -2))
+        y = _center_slice_last_dim(y_pad)
+        if b is not None:
+            y = y + b
+        return y
 
 
 def _apply_rotary_emb(
@@ -91,10 +127,9 @@ class RotaryEmbedding(torch.nn.Module):
         if self.scaling_factor > 1.0:
             concentration = (
                 0.1 * math.log(self.scaling_factor) + 1.0
-            )  # YaRN concentration
+            )
 
             d_half = self.head_dim / 2
-            # NTK by parts
             low = (
                 d_half
                 * math.log(self.initial_context_length / (self.ntk_beta * 2 * math.pi))
@@ -150,7 +185,7 @@ class RotaryEmbedding(torch.nn.Module):
         return query, key
 
 
-def sdpa(Q, K, V, S, sm_scale, sliding_window=0):
+def sdpa(Q, K, V, S, sm_scale, sliding_window=0, circular_causal: bool = False):
     # sliding_window == 0 means no sliding window
     n_tokens, n_heads, q_mult, d_head = Q.shape
     assert K.shape == (n_tokens, n_heads, d_head)
@@ -158,11 +193,24 @@ def sdpa(Q, K, V, S, sm_scale, sliding_window=0):
     K = K[:, :, None, :].expand(-1, -1, q_mult, -1)
     V = V[:, :, None, :].expand(-1, -1, q_mult, -1)
     S = S.reshape(n_heads, q_mult, 1, 1).expand(-1, -1, n_tokens, -1)
-    mask = torch.triu(Q.new_full((n_tokens, n_tokens), -float("inf")), diagonal=1)
-    if sliding_window > 0:
-        mask += torch.tril(
-            mask.new_full((n_tokens, n_tokens), -float("inf")), diagonal=-sliding_window
-        )
+
+    if circular_causal:
+        i = torch.arange(n_tokens, device=Q.device)[:, None]
+        j = torch.arange(n_tokens, device=Q.device)[None, :]
+        dist = (i - j) % n_tokens
+        if sliding_window > 0:
+            allowed = dist <= sliding_window
+        else:
+            allowed = dist >= 0
+        mask = Q.new_zeros((n_tokens, n_tokens))
+        mask = mask.masked_fill(~allowed, -float("inf"))
+    else:
+        mask = torch.triu(Q.new_full((n_tokens, n_tokens), -float("inf")), diagonal=1)
+        if sliding_window > 0:
+            mask += torch.tril(
+                mask.new_full((n_tokens, n_tokens), -float("inf")), diagonal=-sliding_window
+            )
+
     QK = torch.einsum("qhmd,khmd->hmqk", Q, K)
     QK *= sm_scale
     QK += mask[None, None, :, :]
@@ -186,6 +234,7 @@ class AttentionBlock(torch.nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         # Only apply sliding window to every other layer
         self.sliding_window = config.sliding_window if layer_idx % 2 == 0 else 0
+        self.circular_causal = config.circular_causal
         self.sinks = torch.nn.Parameter(
             torch.empty(config.num_attention_heads, device=device, dtype=torch.bfloat16)
         )
@@ -202,6 +251,9 @@ class AttentionBlock(torch.nn.Module):
             device=device,
             dtype=torch.bfloat16,
         )
+        if config.toroidal_linear:
+            self.qkv = ToroidalLinear(self.qkv)
+            self.out = ToroidalLinear(self.out)
         self.sm_scale = 1 / math.sqrt(config.head_dim)
         self.rope = RotaryEmbedding(
             config.head_dim,
@@ -240,7 +292,7 @@ class AttentionBlock(torch.nn.Module):
         k = k.view(-1, self.num_key_value_heads, self.head_dim)
         v = v.view(-1, self.num_key_value_heads, self.head_dim)
         q, k = self.rope(q, k)
-        t = sdpa(q, k, v, self.sinks, self.sm_scale, self.sliding_window)
+        t = sdpa(q, k, v, self.sinks, self.sm_scale, self.sliding_window, circular_causal=self.circular_causal)
         t = self.out(t)
         t = x + t
         return t
@@ -248,11 +300,9 @@ class AttentionBlock(torch.nn.Module):
 
 def swiglu(x, alpha: float = 1.702, limit: float = 7.0):
     x_glu, x_linear = x[..., ::2], x[..., 1::2]
-    # Clamp the input values
     x_glu = x_glu.clamp(min=None, max=limit)
     x_linear = x_linear.clamp(min=-limit, max=limit)
     out_glu = x_glu * torch.sigmoid(alpha * x_glu)
-    # Note we add an extra bias of 1 to the linear layer
     return out_glu * (x_linear + 1)
 
 
@@ -271,6 +321,7 @@ class MLPBlock(torch.nn.Module):
         self.gate = torch.nn.Linear(
             config.hidden_size, config.num_experts, device=device, dtype=torch.bfloat16
         )
+        self.toroidal_enabled = config.toroidal_linear
         assert config.intermediate_size % self.world_size == 0
         self.mlp1_weight = torch.nn.Parameter(
             torch.empty(
@@ -319,16 +370,36 @@ class MLPBlock(torch.nn.Module):
         # MLP #1
         mlp1_weight = self.mlp1_weight[expert_indices, ...]
         mlp1_bias = self.mlp1_bias[expert_indices, ...]
-        t = torch.einsum("beck,bk->bec", mlp1_weight, t) + mlp1_bias
+        if self.toroidal_enabled:
+            w = mlp1_weight
+            w = torch.cat([w[:, :, -1:, :], w, w[:, :, :1, :]], dim=2)
+            w = torch.cat([w[:, :, :, -1:], w, w[:, :, :, :1]], dim=3)
+            xin = _circular_pad_last_dim(t)
+            t = torch.einsum("beck,bk->bec", w, xin)
+            t = _center_slice_last_dim(t)
+            t = t + mlp1_bias
+        else:
+            t = torch.einsum("beck,bk->bec", mlp1_weight, t) + mlp1_bias
         t = swiglu(t, limit=self.swiglu_limit)
 
         # MLP #2
         mlp2_weight = self.mlp2_weight[expert_indices, ...]
         mlp2_bias = self.mlp2_bias[expert_indices, ...]
-        t = torch.einsum("beck,bek->bec", mlp2_weight, t)
-        if self.world_size > 1:
-            dist.all_reduce(t, op=dist.ReduceOp.SUM)
-        t += mlp2_bias
+        if self.toroidal_enabled:
+            w2 = mlp2_weight
+            w2 = torch.cat([w2[:, :, -1:, :], w2, w2[:, :, :1, :]], dim=2)
+            w2 = torch.cat([w2[:, :, :, -1:], w2, w2[:, :, :, :1]], dim=3)
+            tin = _circular_pad_last_dim(t)
+            t = torch.einsum("beck,bek->bec", w2, tin)
+            t = _center_slice_last_dim(t)
+            if self.world_size > 1:
+                dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            t = t + mlp2_bias
+        else:
+            t = torch.einsum("beck,bek->bec", mlp2_weight, t)
+            if self.world_size > 1:
+                dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            t += mlp2_bias
 
         # Weighted sum of experts
         t = torch.einsum("bec,be->bc", t, expert_weights)
@@ -398,6 +469,12 @@ class Transformer(torch.nn.Module):
         with open(config_path, "r") as f:
             json_config = json.load(f)
             config = ModelConfig(**json_config)
+
+        # Optional environment overrides for seamless features
+        if os.environ.get("GPT_OSS_TOROIDAL_LINEAR") == "1":
+            config.toroidal_linear = True
+        if os.environ.get("GPT_OSS_CIRCULAR_CAUSAL") == "1":
+            config.circular_causal = True
 
         model = Transformer(
             config=config,
